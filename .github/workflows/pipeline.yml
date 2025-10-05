@@ -1,0 +1,233 @@
+name: Tourism Project Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PYTHON_VERSION: "3.11"
+  DATASET_REPO: "Yashwanthsairam/tourism-prediction-package"
+  MODEL_REPO:   "Yashwanthsairam/tourism-prediction-package"
+  SPACE_REPO:   "Yashwanthsairam/tourism-prediction-package"
+
+jobs:
+
+  register-dataset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas huggingface_hub
+
+      - name: Upload Dataset to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, sys, pathlib
+          from huggingface_hub import HfApi, create_repo
+          from huggingface_hub.utils import RepositoryNotFoundError
+
+          hf_token = os.environ["HF_TOKEN"]
+          repo_id  = os.environ["DATASET_REPO"]
+          api = HfApi(token=hf_token)
+
+          # 1) ensure dataset repo exists
+          try:
+              api.repo_info(repo_id=repo_id, repo_type="dataset")
+              print(f"[OK] Dataset repo '{repo_id}' exists.")
+          except RepositoryNotFoundError:
+              print(f"[NEW] Creating dataset repo '{repo_id}'...")
+              create_repo(repo_id=repo_id, repo_type="dataset", private=False)
+
+          # 2) try to find the CSV in common locations in the repo
+          candidates = [
+              "tourism_project/data/tourism.csv",
+              "data/tourism.csv",
+              "tourism.csv"
+          ]
+          local_path = None
+          for p in candidates:
+              if os.path.exists(p):
+                  local_path = p
+                  break
+
+          if local_path is None:
+              print("❌ Could not find 'tourism.csv' in any known path.", file=sys.stderr)
+              print("Searched:", candidates, file=sys.stderr)
+              print("\nRepo tree for debugging:\n", file=sys.stderr)
+              for root, dirs, files in os.walk(".", topdown=True):
+                  level = root.count(os.sep)
+                  indent = "  " * level
+                  print(f"{indent}{root}/", file=sys.stderr)
+                  for f in files:
+                      print(f"{indent}  {f}", file=sys.stderr)
+              raise FileNotFoundError("Commit the dataset or adjust the path above.")
+
+          print(f"[UPLOAD] Using local dataset at: {local_path}")
+          api.upload_file(
+              path_or_fileobj=local_path,
+              path_in_repo="tourism.csv",
+              repo_id=repo_id,
+              repo_type="dataset",
+          )
+          print("[DONE] Dataset upload complete.")
+          PY
+
+  data-prep:
+    needs: register-dataset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas scikit-learn datasets huggingface_hub
+
+      - name: Run Data Preparation (split & push X/y to HF Datasets)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from sklearn.model_selection import train_test_split
+          from huggingface_hub import HfApi
+
+          repo_id = os.environ["DATASET_REPO"]
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          # ✅ source from HF dataset we just uploaded so we don't rely on local CSV anymore
+          hf_path = f"hf://datasets/{repo_id}/tourism.csv"
+          print(f"[LOAD] Reading dataset from: {hf_path}")
+          df = pd.read_csv(hf_path)
+
+          # basic cleanup per notebook
+          for col in ["CustomerID", "Unnamed: 0", "Unnamed:0"]:
+              if col in df.columns:
+                  df.drop(columns=[col], inplace=True)
+
+          target = "ProdTaken"
+          if target not in df.columns:
+              raise KeyError(f"Target column '{target}' not found.")
+
+          X = df.drop(columns=[target])
+          y = df[target].astype(int)
+
+          Xtrain, Xtest, ytrain, ytest = train_test_split(
+              X, y, test_size=0.2, random_state=42, stratify=y
+          )
+
+          os.makedirs("prepped", exist_ok=True)
+          Xtrain.to_csv("prepped/Xtrain.csv", index=False)
+          Xtest.to_csv("prepped/Xtest.csv", index=False)
+          ytrain.to_csv("prepped/ytrain.csv", index=False)
+          ytest.to_csv("prepped/ytest.csv", index=False)
+
+          for f in ["Xtrain.csv", "Xtest.csv", "ytrain.csv", "ytest.csv"]:
+              api.upload_file(
+                  path_or_fileobj=f"prepped/{f}",
+                  path_in_repo=f,
+                  repo_id=repo_id,
+                  repo_type="dataset",
+              )
+              print(f"[UPLOAD] {f}")
+          print("[DONE] Data prep complete.")
+          PY
+
+  model-training:
+    needs: data-prep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tourism_project/requirements.txt
+
+      - name: Model Building (train)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MLFLOW_TRACKING_URI: file:./mlruns
+        run: |
+          python tourism_project/model_building/train.py
+
+      - name: Upload model artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: tourism-model-artifacts
+          path: artifacts/**
+
+  deploy-hosting:
+    needs: [model-training, data-prep, register-dataset]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub
+
+      - name: Push files to Frontend Hugging Face Space (Streamlit)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi, create_repo
+          from huggingface_hub.utils import RepositoryNotFoundError
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          space_id = os.environ["SPACE_REPO"]
+
+          # Ensure Space exists (docker or streamlit SDK as you prefer)
+          try:
+              api.repo_info(repo_id=space_id, repo_type="space")
+              print(f"[OK] Space '{space_id}' exists.")
+          except RepositoryNotFoundError:
+              print(f"[NEW] Creating Space '{space_id}' (streamlit)…")
+              create_repo(repo_id=space_id, repo_type="space", private=False, space_sdk="streamlit")
+
+          files = [
+              ("tourism_project/deployment/app.py", "app.py"),
+              ("tourism_project/deployment/requirements.txt", "requirements.txt"),
+          ]
+          for local, dest in files:
+              if not os.path.exists(local):
+                  raise FileNotFoundError(f"Missing file: {local}")
+              api.upload_file(
+                  path_or_fileobj=local,
+                  path_in_repo=dest,
+                  repo_id=space_id,
+                  repo_type="space",
+              )
+              print(f"[UPLOAD] {local} -> {space_id}:{dest}")
+          print("[DONE] Deploy push complete.")
+          PY
