@@ -7,9 +7,9 @@ on:
 
 env:
   PYTHON_VERSION: "3.11"
-  DATASET_REPO: "Yashwanthsairam/tourism-prediction-package"
-  MODEL_REPO:   "Yashwanthsairam/tourism-prediction-package"
-  SPACE_REPO:   "Yashwanthsairam/tourism-prediction-package"
+  DATASET_REPO: "Yashwanthsairam/package-tourism-predict"
+  MODEL_REPO:   "Yashwanthsairam/package-tourism-predict"
+  SPACE_REPO:   "Yashwanthsairam/package-tourism-predict"
 
 jobs:
 
